@@ -64,10 +64,12 @@ jobs:
           security cms -D -i "$PROFILE_PATH" -o "$PLIST_PATH"
           PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST_PATH")
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST_PATH" | sed 's/^[^.]*\.//')
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier' "$PLIST_PATH")
 
           echo "profile_name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
           echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
-          echo "使用描述文件：$PROFILE_NAME / Bundle ID：$BUNDLE_ID"
+          echo "team_id=$TEAM_ID" >> "$GITHUB_OUTPUT"
+          echo "使用描述文件：$PROFILE_NAME / Bundle ID：$BUNDLE_ID / Team ID：$TEAM_ID"
 
       - name: 读取版本号
         id: meta
@@ -89,6 +91,7 @@ jobs:
             -archivePath "$RUNNER_TEMP/$PROJECT_NAME.xcarchive" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
+            DEVELOPMENT_TEAM="${{ steps.profile.outputs.team_id }}" \
             PROVISIONING_PROFILE_SPECIFIER="${{ steps.profile.outputs.profile_name }}" \
             PRODUCT_BUNDLE_IDENTIFIER="${{ steps.profile.outputs.bundle_id }}" \
             ONLY_ACTIVE_ARCH=NO
@@ -108,6 +111,8 @@ jobs:
             <string>manual</string>
             <key>signingCertificate</key>
             <string>Apple Distribution</string>
+            <key>teamID</key>
+            <string>__TEAM_ID__</string>
             <key>uploadSymbols</key>
             <true/>
             <key>destination</key>
@@ -115,6 +120,7 @@ jobs:
             <key>provisioningProfiles</key>
             <dict>
           PLIST_HEAD
+          sed -i '' "s/__TEAM_ID__/${{ steps.profile.outputs.team_id }}/" "$EXPORT_OPTIONS"
           echo "    <key>${{ steps.profile.outputs.bundle_id }}</key>" >> "$EXPORT_OPTIONS"
           echo "    <string>${{ steps.profile.outputs.profile_name }}</string>" >> "$EXPORT_OPTIONS"
           cat >> "$EXPORT_OPTIONS" <<'PLIST_TAIL'
