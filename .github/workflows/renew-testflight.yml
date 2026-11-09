@@ -1,0 +1,90 @@
+name: TestFlight Auto Renew
+
+# TestFlight 构建自上传起 90 天过期。本 workflow 每天检查一次最新构建的到期日，
+# 剩余 <= 30 天时自动: 构建版本号 +1 -> 重新构建 -> 上传 TestFlight。
+# 不用固定 80 天定时器的理由: cron 做不到精确 80 天, 且 GitHub 定时任务偶发跳过,
+# 每日检查 + 30 天阈值可以容忍连续 60 天的漏跑。
+
+on:
+  schedule:
+    - cron: '23 20 * * *'   # 每日 UTC 20:23 = 北京时间 04:23
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略到期检查, 强制续期'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # 续期时要把版本号 +1 提交回仓库
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      need: ${{ steps.expire.outputs.need }}
+      days: ${{ steps.expire.outputs.days }}
+    env:
+      BUNDLE_ID: com.xavior.baiyunkey
+      ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+      KEYID: ${{ secrets.ASC_KEY_ID }}
+      P8B64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+    steps:
+      - name: 查询最新构建的到期日
+        id: expire
+        run: |
+          pip install pyjwt --quiet
+          python3 - <<'PY'
+          import base64, datetime, json, os, time, urllib.request, urllib.error
+          import jwt
+
+          key = base64.b64decode(os.environ["P8B64"])
+
+          def token():
+              now = int(time.time())
+              return jwt.encode(
+                  {"iss": os.environ["ISSUER"], "iat": now, "exp": now + 1200,
+                   "aud": "appstoreconnect-v1"},
+                  key, algorithm="ES256", headers={"kid": os.environ["KEYID"]})
+
+          def api(path):
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com" + path,
+                                           headers={"Authorization": "Bearer " + token()})
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read().decode())
+
+          apps = api(f"/v1/apps?filter[bundleId]={os.environ['BUNDLE_ID']}")
+          data = apps.get("data", [])
+          if not data:
+              # App 记录不存在 → 后续构建必然失败, 也标记为需要续期让错误暴露出来
+              print("no app record found, forcing renewal")
+              print("need=yes\ndays=999")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("need=yes\ndays=999\n")
+              raise SystemExit(0)
+          app_id = data[0]["id"]
+
+          builds = api(f"/v1/builds?filter[app]={app_id}&limit=1&sort=-uploadedDate")
+          bdata = builds.get("data", [])
+          if not bdata:
+              print("no build yet, forcing renewal")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("need=yes\ndays=999\n")
+              raise SystemExit(0)
+
+          b = bdata[0]["attributes"]
+          exp = datetime.datetime.fromisoformat(b["expirationDate"].replace("Z", "+00:00"))
+          days = (exp - datetime.datetime.now(datetime.timezone.utc)).days
+          print(f"build {b.get('version')} uploaded {b.get('uploadedDate')}, expires {b['expirationDate']}, {days} days left")
+          need = "yes" if days <= 30 else "no"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"need={need}\ndays={days}\n")
+          PY
+
+  renew:
+    needs: check
+    if: needs.check.outputs.need == 'yes' || inputs.force == true
+    uses: ./.github/workflows/build-testflight.yml
+    with:
+      bump_build: true
+    secrets: inherit

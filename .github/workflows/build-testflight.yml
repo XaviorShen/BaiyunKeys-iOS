@@ -2,6 +2,16 @@ name: Build TestFlight
 
 on:
   workflow_dispatch:
+    inputs:
+      bump_build:
+        description: '构建版本号 +1 并提交(自动续期用)'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      bump_build:
+        type: boolean
+        default: false
   push:
     tags: ["v*"]
 
@@ -19,6 +29,21 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
+
+      - name: 构建版本号 +1（自动续期用）
+        if: inputs.bump_build == true
+        run: |
+          set -euo pipefail
+          FILE="$PROJECT_NAME.xcodeproj/project.pbxproj"
+          CURRENT=$(grep -m1 'CURRENT_PROJECT_VERSION' "$FILE" | sed -E 's/.*= *([0-9]+);.*/\1/')
+          NEXT=$((CURRENT + 1))
+          sed -i '' "s/CURRENT_PROJECT_VERSION = $CURRENT;/CURRENT_PROJECT_VERSION = $NEXT;/g" "$FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FILE"
+          git commit -m "ci: build number $CURRENT -> $NEXT (TestFlight auto-renew)"
+          git push origin HEAD:main
+          echo "构建版本号 $CURRENT -> $NEXT，已提交"
 
       - name: 选择 Xcode 26
         run: |
