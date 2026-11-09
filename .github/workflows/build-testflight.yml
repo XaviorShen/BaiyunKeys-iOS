@@ -20,10 +20,15 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: 选择 Xcode 16
+      - name: 选择 Xcode 26
         run: |
           set -euo pipefail
-          XCODE_PATH=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          # Apple 要求上传必须用 Xcode 26 (iOS 26 SDK) 构建；取最高版本，
+          # 没有 26 才退回 16（工程 objectVersion 77 向后兼容）
+          XCODE_PATH=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$XCODE_PATH" ]; then
+            XCODE_PATH=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          fi
           if [ -n "$XCODE_PATH" ]; then
             sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           fi
@@ -148,6 +153,7 @@ jobs:
           retention-days: 30
 
       - name: 上传 TestFlight（altool）
+        id: upload_altool
         continue-on-error: true
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -164,7 +170,7 @@ jobs:
           echo "已提交到 App Store Connect，等构建处理完成后到 TestFlight 分发"
 
       - name: 上传 TestFlight（fastlane 兜底）
-        if: failure()
+        if: steps.upload_altool.outcome == 'failure'
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
