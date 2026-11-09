@@ -14,10 +14,12 @@ Payload/
 *.xcarchive
 
 # 签名材料 —— 绝对不要提交
+signing/
 *.p12
 *.mobileprovision
 *.cer
 *.certSigningRequest
+*.key
 
 # macOS
 .DS_Store

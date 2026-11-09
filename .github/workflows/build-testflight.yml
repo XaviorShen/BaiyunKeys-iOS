@@ -1,0 +1,157 @@
+name: Build TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  PROJECT_NAME: BaiyunKeys
+  SCHEME: BaiyunKeys
+  CONFIGURATION: Release
+
+jobs:
+  testflight:
+    # objectVersion 77 的工程需要 Xcode 16，必须 macos-15
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 选择 Xcode 16
+        run: |
+          set -euo pipefail
+          XCODE_PATH=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$XCODE_PATH" ]; then
+            sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: 导入签名证书（P12）
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      - name: 导入描述文件并解析参数
+        id: profile
+        env:
+          BUILD_PROVISION_BASE64: ${{ secrets.BUILD_PROVISION_BASE64 }}
+        run: |
+          set -euo pipefail
+          PROFILE_PATH="$RUNNER_TEMP/appstore.mobileprovision"
+          echo -n "$BUILD_PROVISION_BASE64" | base64 --decode -o "$PROFILE_PATH"
+
+          mkdir -p ~/Library/MobileDevice/"Provisioning Profiles"
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/"Provisioning Profiles"/
+
+          # 从描述文件里解析出 名称 / UUID / Bundle ID，工程不用手改
+          PLIST_PATH="$RUNNER_TEMP/profile.plist"
+          security cms -D -i "$PROFILE_PATH" -o "$PLIST_PATH"
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST_PATH")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST_PATH" | sed 's/^[^.]*\.//')
+
+          echo "profile_name=$PROFILE_NAME" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$BUNDLE_ID" >> "$GITHUB_OUTPUT"
+          echo "使用描述文件：$PROFILE_NAME / Bundle ID：$BUNDLE_ID"
+
+      - name: 读取版本号
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 'MARKETING_VERSION' "$PROJECT_NAME.xcodeproj/project.pbxproj" \
+                    | sed -E 's/.*= *([^;]+);.*/\1/' | tr -d ' "')
+          [ -n "$VERSION" ] || VERSION=0.0.0
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 签名构建 Archive
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project "$PROJECT_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/$PROJECT_NAME.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.profile.outputs.profile_name }}" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ steps.profile.outputs.bundle_id }}" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: 导出 App Store 签名 IPA
+        run: |
+          set -euo pipefail
+          EXPORT_OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$EXPORT_OPTIONS" <<'PLIST_HEAD'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Apple Distribution</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>destination</key>
+            <string>export</string>
+            <key>provisioningProfiles</key>
+            <dict>
+          PLIST_HEAD
+          echo "    <key>${{ steps.profile.outputs.bundle_id }}</key>" >> "$EXPORT_OPTIONS"
+          echo "    <string>${{ steps.profile.outputs.profile_name }}</string>" >> "$EXPORT_OPTIONS"
+          cat >> "$EXPORT_OPTIONS" <<'PLIST_TAIL'
+            </dict>
+          </dict>
+          </plist>
+          PLIST_TAIL
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/$PROJECT_NAME.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$EXPORT_OPTIONS"
+
+          IPA_PATH=$(find "$RUNNER_TEMP/export" -name "*.ipa" -type f | head -1)
+          [ -n "$IPA_PATH" ] || { echo "::error::导出目录下没有 IPA"; exit 1; }
+          echo "IPA_PATH=$IPA_PATH" >> "$GITHUB_ENV"
+          echo "签名 IPA：$IPA_PATH"
+
+      - name: 上传签名 IPA 产物（备用，上传 TestFlight 失败时可直接拿去 Transporter 传）
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PROJECT_NAME }}-${{ steps.meta.outputs.version }}-appstore-signed
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传 TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/private_keys
+          echo -n "$ASC_API_KEY_P8_BASE64" | base64 --decode -o "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          xcrun altool --upload-app -f "$IPA_PATH" \
+            --type ios-app \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+          echo "已提交到 App Store Connect，等构建处理完成后到 TestFlight 分发"
